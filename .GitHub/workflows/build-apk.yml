@@ -1,0 +1,204 @@
+name: Web2Droid — Drop-In ZIP to Android APK Cloud Compiler
+
+on:
+  # Automatically triggers whenever you drag-and-drop/commit a Web2Droid .zip file to the repo
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - "**.zip"
+      - "app/**"
+      - "build.gradle.kts"
+      - "settings.gradle.kts"
+      - ".github/workflows/build-apk.yml"
+
+  # Allows manual 1-click triggering from the GitHub "Actions" tab
+  workflow_dispatch:
+    inputs:
+      zip_file:
+        description: "Optional: Specific .zip filename to compile (leave blank to auto-detect newest .zip)"
+        required: false
+        default: ""
+      publish_release:
+        description: "Also publish compiled APK to GitHub Releases?"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  compile-web2droid-apk:
+    name: Extract Web2Droid ZIP & Compile Signed APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Auto-Detect & Extract Dropped Web2Droid (.ZIP)
+        id: extract_zip
+        shell: bash
+        run: |
+          set -e
+          mkdir -p build-workspace
+
+          INPUT_ZIP="${{ github.event.inputs.zip_file }}"
+
+          if [ -n "$INPUT_ZIP" ] && [ -f "$INPUT_ZIP" ]; then
+            TARGET_ZIP="$INPUT_ZIP"
+          else
+            # Find the most recently modified/dropped .zip file in the repository
+            TARGET_ZIP=$(find . -maxdepth 3 -name "*.zip" -not -path "./.git/*" -printf "%T@ %p\n" | sort -nr | head -n 1 | cut -d' ' -f2-)
+          fi
+
+          if [ -n "$TARGET_ZIP" ] && [ -f "$TARGET_ZIP" ]; then
+            echo "Found dropped Web2Droid archive: $TARGET_ZIP"
+            unzip -q -o "$TARGET_ZIP" -d build-workspace
+
+            # Handle case where ZIP contains a single top-level folder
+            if [ ! -f "build-workspace/settings.gradle.kts" ]; then
+              SUBDIR=$(find build-workspace -maxdepth 2 -name "settings.gradle.kts" -printf "%h\n" | head -n 1)
+              if [ -n "$SUBDIR" ]; then
+                cp -r "$SUBDIR"/* build-workspace/
+              fi
+            fi
+            echo "work_dir=build-workspace" >> $GITHUB_OUTPUT
+            echo "source_name=$(basename "$TARGET_ZIP" .zip)" >> $GITHUB_OUTPUT
+            echo "mode=zip-drop" >> $GITHUB_OUTPUT
+          elif [ -f "settings.gradle.kts" ] && [ -d "app" ]; then
+            echo "No .zip archive found, but detected extracted Web2Droid project in repository root."
+            cp -r app build.gradle.kts settings.gradle.kts gradle.properties build-workspace/ 2>/dev/null || true
+            echo "work_dir=build-workspace" >> $GITHUB_OUTPUT
+            echo "source_name=${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
+            echo "mode=extracted-root" >> $GITHUB_OUTPUT
+          else
+            echo "::error::No Web2Droid .zip file or Android project found! Drag and drop your exported Web2Droid .zip file into this repository to build an APK."
+            exit 1
+          fi
+
+      - name: 3. Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 4. Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 5. Set up Gradle 8.7 (Compatible with AGP 8.5)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+          cache-read-only: false
+
+      - name: 6. Bootstrap Gradle Wrapper & Compile APKs
+        working-directory: ${{ steps.extract_zip.outputs.work_dir }}
+        shell: bash
+        run: |
+          set -e
+          echo "Generating Gradle 8.7 Wrapper..."
+          gradle wrapper --gradle-version 8.7
+          chmod +x ./gradlew
+
+          echo "Compiling Debug & Release APKs..."
+          ./gradlew assembleDebug assembleRelease --no-daemon --stacktrace
+
+      - name: 7. Sign & Align Release APK for Direct Phone Installation
+        id: sign_apk
+        working-directory: ${{ steps.extract_zip.outputs.work_dir }}
+        shell: bash
+        run: |
+          set -e
+          mkdir -p dist-apks
+
+          # Extract metadata from app/build.gradle.kts for clean APK naming
+          APP_ID=$(grep 'applicationId =' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/' || echo "com.web2droid.app")
+          VERSION_NAME=$(grep 'versionName =' app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/' || echo "1.0.0")
+          SLUG="${{ steps.extract_zip.outputs.source_name }}"
+
+          # 1. Copy ready-to-install Debug APK
+          DEBUG_APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
+          OUT_DEBUG="dist-apks/${SLUG}-v${VERSION_NAME}-debug.apk"
+          cp "$DEBUG_APK" "$OUT_DEBUG"
+
+          # 2. Generate a signing keystore so the Release APK installs on any Android device
+          KEYSTORE_FILE="web2droid-release.jks"
+          keytool -genkeypair -v \
+            -keystore "$KEYSTORE_FILE" \
+            -alias web2droid_key \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass android123 \
+            -keypass android123 \
+            -dname "CN=Web2Droid Studio, OU=Mobile, O=Web2Droid, L=Denver, S=CO, C=US"
+
+          # Locate latest Android SDK build-tools for zipalign & apksigner
+          BUILD_TOOLS_DIR=$(ls -d$ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          UNSIGNED_REL_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          ALIGNED_APK="app/build/outputs/apk/release/app-release-aligned.apk"
+          OUT_RELEASE="dist-apks/${SLUG}-v${VERSION_NAME}-release-signed.apk"
+
+          "$BUILD_TOOLS_DIR/zipalign" -v -p 4 "$UNSIGNED_REL_APK" "$ALIGNED_APK"
+          "$BUILD_TOOLS_DIR/apksigner" sign \
+            --ks "$KEYSTORE_FILE" \
+            --ks-key-alias web2droid_key \
+            --ks-pass pass:android123 \
+            --key-pass pass:android123 \
+            --out "$OUT_RELEASE" \
+            "$ALIGNED_APK"
+
+          DEBUG_SIZE=$(du -h "$OUT_DEBUG" | cut -f1)
+          REL_SIZE=$(du -h "$OUT_RELEASE" | cut -f1)
+          REL_SHA256=$(sha256sum "$OUT_RELEASE" | cut -d' ' -f1)
+
+          echo "app_id=$APP_ID" >> $GITHUB_OUTPUT
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "debug_size=$DEBUG_SIZE" >> $GITHUB_OUTPUT
+          echo "rel_size=$REL_SIZE" >> $GITHUB_OUTPUT
+          echo "rel_sha256=$REL_SHA256" >> $GITHUB_OUTPUT
+
+      - name: 8. Upload Downloadable APK Bundle (GitHub Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.extract_zip.outputs.source_name }}-android-apks
+          path: ${{ steps.extract_zip.outputs.work_dir }}/dist-apks/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 9. Write Build Summary & Download Instructions
+        shell: bash
+        run: |
+          cat << 'EOF' >> $GITHUB_STEP_SUMMARY
+          ## 🤖 Web2Droid Cloud APK Build Succeeded!
+
+          Your HTML5 application has been compiled into native Android `.apk` packages ready to install on any Android device.
+
+          | Property | Value |
+          | :--- | :--- |
+          | **Source Archive** | `${{ steps.extract_zip.outputs.source_name }}` (${{ steps.extract_zip.outputs.mode }}) |
+          | **Android Application ID** | `${{ steps.sign_apk.outputs.app_id }}` |
+          | **App Version** | `v${{ steps.sign_apk.outputs.version_name }}` |
+          | **Signed Release APK Size** | `${{ steps.sign_apk.outputs.rel_size }}` |
+          | **Debug APK Size** | `${{ steps.sign_apk.outputs.debug_size }}` |
+          | **Release SHA-256** | `${{ steps.sign_apk.outputs.rel_sha256 }}` |
+
+          ### 📲 How to Install on Your Android Phone:
+          1. Scroll down to the **Artifacts** section at the bottom of this workflow run page.
+          2. Click **`${{ steps.extract_zip.outputs.source_name }}-android-apks`** to download the bundle.
+          3. Transfer **`*-release-signed.apk`** (or `*-debug.apk`) to your Android phone and tap it to install!
+          EOF
+
+      - name: 10. Optional — Publish APKs to GitHub Releases
+        if: ${{ github.event.inputs.publish_release == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.sign_apk.outputs.version_name }}-build.${{ github.run_number }}
+          name: "${{ steps.extract_zip.outputs.source_name }} v${{ steps.sign_apk.outputs.version_name }} (Android APK)"
+          body: |
+            Automated Android APK build compiled from Web2Droid Studio `.zip` archive.
+            - **Package ID:** `${{ steps.sign_apk.outputs.app_id }}`
+            - **Signed Release SHA-256:** `${{ steps.sign_apk.outputs.rel_sha256 }}`
+          files: ${{ steps.extract_zip.outputs.work_dir }}/dist-apks/*.apk
